@@ -1,0 +1,5 @@
+this node takes the streaming image and converts to useable 3D info.
+comes in as a (2008*2008?) image with virtual depth. converts virtual depth to
+metric depth following raytrix equations for plenoptic cameras and the
+information gleaned from calibration.
+calibration includes 2D intrinsic calibration and 3D metric calibration. 

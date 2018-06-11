@@ -1,0 +1,24 @@
+<launch>
+
+  <!-- Set this to your camera's name -->
+  <arg name="cam_name" default="raytrix"/>
+
+  <node pkg="raytrix"
+  	type="raytrix"
+	name="raytrix"
+  output="screen"
+	args="192.168.0.43 10000" >
+  </node>
+
+  <!-- Provide rectification -->
+  <node pkg="image_proc"
+        type="image_proc"
+        name="rectifier"
+        ns="$(arg cam_name)">
+    <remap from="$(arg cam_name)/image_raw" to="image_raw"/>
+    <remap from="$(arg cam_name)/image_rect_color" to="image_rect_color"/>
+    <remap from="$(arg cam_name)/image_info" to="image_info"/>
+  </node>
+
+</launch>
+

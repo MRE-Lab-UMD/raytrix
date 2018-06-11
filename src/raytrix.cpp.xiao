@@ -1,0 +1,412 @@
+/*  
+ * $Id: raytrix.cpp 8800 07-15-2014 ashadema $
+ * Software License Agreement (BSD License)
+ *
+ *  Copyright (c) 2014, Shiekh Zayed Institute for Pediatric Surgical
+ *  Innovation. All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, are permitted provided that the following conditions
+ *  are met:
+ *
+ *   * Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above
+ *     copyright notice, this list of conditions and the following
+ *     disclaimer in the documentation and/or other materials provided
+ *     with the distribution.
+ *   * Neither the name of Willow Garage, Inc. nor the names of its
+ *     contributors may be used to endorse or promote products derived
+ *     from this software without specific prior written permission.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ *  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ *  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ *  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ *  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ *  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ *  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ *  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ *  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ *  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *  POSSIBILITY OF SUCH DAMAGE.
+ *
+ *
+ */
+#include "coeff.h" //for the correction from xizo
+
+#include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/CameraInfo.h>
+#include <sensor_msgs/SetCameraInfo.h>
+#include <tf_conversions/tf_eigen.h>
+
+#include <image_transport/image_transport.h>
+#include <camera_info_manager/camera_info_manager.h>
+
+#include <tf/transform_listener.h>
+
+#include <sensor_msgs/fill_image.h>
+#include <pcl_ros/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/common/transforms.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <netdb.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#include <iostream>
+#include <fstream>
+#include <valarray> 
+#include <Eigen/Dense>
+
+using namespace std;
+
+/**
+  \author Azad Shademan, Ryan Decker, Simon Leonard 
+
+  @b raytrix is a ros node that listens to the raw data on the socket from the raytrix machine.
+  The raw data includes the virtual depth in raytrix frame (z axis pointing towards the sensor) and
+  raw (unrectified) focused images. The launch file engages the image_proc, which looks for intrinsic
+  calibration (found independently through cameracalibrator.py) and publishes the rectified image_rect
+  topic. The metric point cloud is published in the /raytrix/pcl topic. 
+
+ **/
+
+
+// Return a predicted value for the error in X, given an XYZ location of a point
+// within the camera's field of view.
+double predictErrorX(double x, double y, double z) {
+  double errX = coeffX1*x*x*x + coeffX2*x*x*y + coeffX3*x*x*z + coeffX4*x*x + \
+                coeffX5*x*y*y + coeffX6*x*y*z + coeffX7*x*y + coeffX8*x*z*z + \
+                coeffX9*x*z + coeffX10*x + coeffX11*y*y*y + coeffX12*y*y*z + \
+                coeffX13*y*y + coeffX14*y*z*z + coeffX15*y*z + coeffX16*y + \
+                coeffX17*z*z*z+ coeffX18*z*z + coeffX19*z + coeffX20;
+  return errX;
+}
+
+// Same for Y.
+double predictErrorY(double x, double y, double z) {
+  double errY = coeffY1*x*x*x + coeffY2*x*x*y + coeffY3*x*x*z + coeffY4*x*x + \
+                coeffY5*x*y*y + coeffY6*x*y*z + coeffY7*x*y + coeffY8*x*z*z + \
+                coeffY9*x*z + coeffY10*x + coeffY11*y*y*y + coeffY12*y*y*z + \
+                coeffY13*y*y + coeffY14*y*z*z + coeffY15*y*z + coeffY16*y + \
+                coeffY17*z*z*z+ coeffY18*z*z + coeffY19*z + coeffY20;
+  return errY;
+}
+
+// Same for Z.
+double predictErrorZ(double x, double y, double z) {
+  double errZ = coeffZ1*x*x*x + coeffZ2*x*x*y + coeffZ3*x*x*z + coeffZ4*x*x + \
+                coeffZ5*x*y*y + coeffZ6*x*y*z + coeffZ7*x*y + coeffZ8*x*z*z + \
+                coeffZ9*x*z + coeffZ10*x + coeffZ11*y*y*y + coeffZ12*y*y*z + \
+                coeffZ13*y*y + coeffZ14*y*z*z + coeffZ15*y*z + coeffZ16*y + \
+                coeffZ17*z*z*z+ coeffZ18*z*z + coeffZ19*z + coeffZ20;
+  return errZ;
+}
+
+
+int main( int argc, char** argv ){
+
+  ros::init( argc, argv, "raytrix" );
+
+  int sockfd, portno;
+  struct sockaddr_in serv_addr;
+  struct hostent *server;
+
+  if( (argc != 3) && (argc != 4) ){
+    std::cerr << "usage: " << argv[0] << " hostname port [scale file]"
+      << std::endl
+      << "Try 192.168.0.43 for hostname and 10000 for port /AS"
+      << std::endl;
+    return -1;
+  }
+
+  portno = atoi(argv[2]);
+
+  // Configure the network connection
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if( sockfd < 0 ){
+    perror("ERROR opening socket");
+    return -1;
+  }
+
+  server = gethostbyname(argv[1]);
+  if( server == NULL ) {
+    std::cerr << "ERROR, no such host" << std::endl;
+    return -1;
+  }
+
+  bzero((char *) &serv_addr, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  bcopy((char *)server->h_addr,
+      (char *)&serv_addr.sin_addr.s_addr,
+      server->h_length);
+  serv_addr.sin_port = htons(portno);
+
+  if( connect( sockfd, (sockaddr*)&serv_addr, sizeof( serv_addr ) ) < 0 ){
+    perror("ERROR connecting");
+    return -1;
+  }
+
+
+  ros::NodeHandle nh("~");
+  image_transport::ImageTransport it(nh);
+  camera_info_manager::CameraInfoManager camera_info_manager(nh);
+  camera_info_manager.setCameraName( "raytrix" );
+
+  // Configure the ROS publishers
+  image_transport::CameraPublisher pub_image;
+  const std::string image_topic( "/raytrix/image_raw" );
+  pub_image = it.advertiseCamera( image_topic, 1 );
+
+  ros::Publisher pub_depth;
+  const std::string depth_topic( "/raytrix/depth" );
+  pub_depth = nh.advertise<sensor_msgs::Image>( depth_topic, 1 );
+
+  ros::Publisher pub_pcl;
+  const std::string pcl_topic( "/raytrix/pcl" );
+  pub_pcl = nh.advertise< pcl::PointCloud<pcl::PointXYZI> >( pcl_topic, 1 );
+
+  // Read the scale file
+  double scalex=1, scaley=1, scalez=1;
+
+  if( argc == 4 ){
+    std::ifstream ifs;
+    ifs.open( argv[3] );
+    ifs >> scalex >> scaley >> scalez;
+    ifs.close();
+  }
+
+  tf::TransformListener listener;
+
+  // main while loop
+  unsigned int seq = 0;
+  while( nh.ok() ){
+
+    std_msgs::Header header;
+    header.stamp = ros::Time::now();
+    header.seq = seq++;
+    header.frame_id = std::string( "/raytrix" );
+
+    // receive the intensity image
+    int imgwidth, imgheight;
+    recv( sockfd, &imgwidth, sizeof(imgwidth), MSG_WAITALL );
+    recv( sockfd, &imgheight, sizeof(imgheight), MSG_WAITALL );
+
+    unsigned char* img = new unsigned char[ imgwidth*imgheight ];
+    recv( sockfd, img, sizeof(unsigned char)*imgwidth*imgheight, MSG_WAITALL );
+
+    sensor_msgs::CameraInfoPtr cinfo;
+    cinfo.reset(new sensor_msgs::CameraInfo(camera_info_manager.getCameraInfo()));
+    cinfo->header = header;
+
+    // create a ROS image and publish
+    sensor_msgs::ImagePtr msgimg( new sensor_msgs::Image() );
+    msgimg->header = header;
+    sensor_msgs::fillImage( *msgimg,
+        sensor_msgs::image_encodings::MONO8,
+        imgheight,
+        imgwidth,
+        imgwidth*sizeof(unsigned char),
+        img );
+    pub_image.publish( msgimg, cinfo );
+
+    // receive the depth map
+    int dptwidth, dptheight;
+    recv( sockfd, &dptwidth, sizeof(dptwidth), MSG_WAITALL );
+    recv( sockfd, &dptheight, sizeof(dptheight), MSG_WAITALL );
+
+    float* dpt = new float[ dptwidth*dptheight ] ;
+    recv( sockfd, dpt, sizeof(float)*dptwidth*dptheight, MSG_WAITALL );
+
+    // create a ROS depth image and publish
+    sensor_msgs::Image msgdpt;
+    msgdpt.header = header;
+    sensor_msgs::fillImage( msgdpt,
+        sensor_msgs::image_encodings::TYPE_32FC1,
+        dptheight,
+        dptwidth,
+        dptwidth*sizeof(float),
+        dpt );
+    pub_depth.publish( msgdpt );
+
+    // create and publish a point cloud for all points obtained from RxLive
+    pcl::PointCloud<pcl::PointXYZI>::Ptr
+      pcl_msg( new pcl::PointCloud<pcl::PointXYZI>() );
+
+    // pcl data structure initialization
+    pcl_msg->header = header; //pcl_conversions::toPCL( header );
+    pcl_msg->height = dptheight;
+    pcl_msg->width = dptwidth;
+    //pcl_msg->is_dense = false;
+
+    pcl_msg->points.resize( pcl_msg->height * pcl_msg->width );
+    pcl::PointCloud<pcl::PointXYZI>::iterator pt_iter = pcl_msg->begin();
+
+    // convert
+    float f_L = 25.6736073634001; //focal length in mm
+    float T_L = 913.563818145304; // focus distance in mm
+    float B = 0.94165; // Internal camera offset - distance between micro lens array and image plane
+
+    int v_TCP = 2; //virtual depth of TCP
+    float s_P = 2 * 0.0047; //pixel size in mm, times two because lightfield cameras have reduced resolution
+    float B_L = T_L/2 * (1-sqrt(1-(4*f_L)/(T_L))); //calculate distance from TCP to main lens center
+
+    float xMetric;
+    float yMetric;
+    float zMetric;
+    double x, y, z;
+    float b_L;
+    float a_L;
+    using namespace Eigen;
+    using namespace std;
+    VectorXd acLHS; //for distortion correction
+    VectorXd acRHS;
+    MatrixXd a(6,1);
+    a(0,0) = -379.54; //from matlab note a(0,0) is the z distance, you should change it
+    a(1,0) = -0.1128;
+    a(2,0) = 0.0036;
+    a(3,0) = 0.0;
+    a(4,0) = 0.0235;
+    a(5,0) = 0.0026;
+
+    //loop through all pixels
+    for( int dptu=0; dptu<(int)pcl_msg->width; ++dptu ){
+      for( int dptv=0; dptv<(int)pcl_msg->height; ++dptv, ++pt_iter){
+        // Fill in XYZ
+        x = dptu;
+        y = dptv;
+        z = dpt[dptv*dptwidth+dptu];
+        //transform from virtual depth to lens csys
+        if (z!=0) {
+          z = 1/(1-z); // transform depth values to space II: virtual depth units, lateral coordinates in pixels
+          z = (z - v_TCP)*B; //to space III': metric depth units from TCP
+
+          b_L = z + B_L; //to space III: metric depth units from lens center
+          //project through main lens: depth
+          a_L = (b_L*f_L)/(b_L-f_L); // to space V': metric depth values from lens center
+
+          //project through main lens: lateral coordinates
+          //convert to metric coordinates on sensor with pixel size
+          xMetric = (x-(int)pcl_msg->width / 2) * s_P;
+          yMetric = (y-(int)pcl_msg->height / 2) * s_P;
+          //project with pinhole model
+          xMetric = xMetric * a_L/b_L;
+          yMetric = yMetric * a_L/b_L;
+          zMetric = -(a_L +B_L) ; //flip z here? wrong directions??
+        }
+        else
+        {
+          xMetric = 0.0;
+          yMetric = 0.0;
+          zMetric = 0.0;
+        }
+
+        //pcl::PointXYZI& pt = *pt_iter; //put in point cloud
+        pcl::PointXYZI& pt = pcl_msg->at( dptu, dptv );
+
+        pt.x = (-xMetric)/1000; //flip coordinates, put to meters
+        pt.y = (-yMetric)/1000;
+        pt.z = zMetric; //correct z later
+
+        //previous stuff for intensity of image
+        int imgu = dptu * ( (float)(imgwidth) ) / ( (float)(dptwidth) );
+        int imgv = dptv * ( (float)(imgheight) ) / ( (float)(dptheight) );
+        pt.intensity = img[imgv*imgwidth+imgu];
+
+
+        //now correct for the nonlinear Z scaling to give expanded depth FOV
+        //double PCLdiff = 300 - pt.z; //403 is our 0, our 'sweet spot'
+        //double Zerror = 1.666*PCLdiff; //error to the CamPose estimated CSYS in Z //was 0.89
+        //pt.z = (pt.z - Zerror); //subtract the predicted error to get good Z value
+
+        pt.z = (-pt.z + 680); //this is to get on the right side, with right motion
+        pt.z = (pt.z)/1000; // convert to m
+
+        // translation found from chessboard evaluation
+        double dx, dy, dz;
+        ///////////////////////////////////////////
+        if (1) {
+          dx = 0.008653;
+          dy = -0.005524;
+          dz = -0.319190;
+        }
+        else
+        {
+          dx = 0;
+          dy = 0;
+          dz = 0;
+        }
+
+        pt.x = pt.x + dx ;
+        pt.y = pt.y + dy ;
+        pt.z = pt.z + dz ;
+
+        //rsd - crop the point cloud in z 6.12.15
+        bool cropPCL = false; //true;
+        double zThresh = 0.3;
+        if(cropPCL){
+          if(pt.z > zThresh){
+            pt.z = 0;
+          }
+        }
+
+
+        //xiao correction - nonlinear 3rd order correction
+        pcl::PointXYZI& ptNew = pcl_msg->at( dptu, dptv );
+        //convert to mm before correction
+        pt.x = pt.x * 1000;
+        pt.y = pt.y * 1000;
+        pt.z = pt.z * 1000;
+        ptNew.x = (pt.x - predictErrorX(pt.x, pt.y, pt.z))/1000;//correction
+        ptNew.y = (pt.y - predictErrorY(pt.x, pt.y, pt.z))/1000;
+        ptNew.z = (pt.z - predictErrorZ(pt.x, pt.y, pt.z))/1000;
+        pt = ptNew;
+        //put back at correct z offset
+        pt.z = pt.z + 0.294; //TODO may need to adjust this
+
+      }
+    }
+
+    pub_pcl.publish( pcl_msg);
+
+    delete[] img;
+    delete[] dpt;
+
+    tf::StampedTransform tfRt0r;
+    try{
+      listener.lookupTransform( "LWR_0", "raytrix", ros::Time(0), tfRt0r );
+    }
+    catch(tf::TransformException ex ){}
+
+    /*
+    // code sample to transform cloud to a different frame 
+    try{
+    tf::StampedTransform tfRt0r;
+    listener.lookupTransform( "LWR_0", "raytrix", ros::Time(0), tfRt0r );
+    //listener.lookupTransform( "raytrix", "LWR_0", ros::Time(0), tfRt0r );
+
+    Eigen::Affine3d eigdRt0r;
+    tf::TransformTFToEigen( tfRt0r, eigdRt0r );
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_rtmsg( new pcl::PointCloud<pcl::PointXYZI>() );
+    Eigen::Affine3f eigfRt0r( eigdRt0r );
+    pcl::transformPointCloud( *pcl_msg, *pcl_rtmsg, eigfRt0r );
+    pcl_rtmsg->header.frame_id = std::string( "LWR_0" );
+
+    //pub_pcl.publish( pcl_rtmsg );
+
+    } catch(tf::TransformException ex ){
+    pub_pcl.publish( pcl_msg );
+    } 
+     */
+  }
+  return 0;
+}
+

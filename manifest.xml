@@ -1,0 +1,19 @@
+<package>
+  <description brief="raytrix">
+
+     raytrix
+
+  </description>
+  <author>Simon Leonard</author>
+  <license>BSD</license>
+  <review status="unreviewed" notes=""/>
+  <url>http://ros.org/wiki/raytrix</url>
+  <depend package="camera_info_manager"/>
+  <depend package="pcl_ros"/>
+  <depend package="opencv2"/>
+  <depend package="image_transport"/>
+  <depend package="tf_conversions"/>
+
+</package>
+
+
